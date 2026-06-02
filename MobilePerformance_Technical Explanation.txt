@@ -1,0 +1,215 @@
+--------------------------------------------------------------------------------
+1. HOW I APPROACHED THE OPTIMIZATION
+--------------------------------------------------------------------------------
+ 
+La pipeline que he seguido se basa en 5 puntos:
+ 
+  1 - Observar la estructura de la escena
+    
+  2 - Identificar los posibles problemas que puedan suceder en los scripts antes 
+      de perfilar
+ 
+  3 - Medir con herramientas de Unity usando el Profiler y el Frame Debugger
+ 
+  4 - Identificar problemas a nivel de escena más allá de los scripts
+
+  5 - Corregir los problemas señalados en el Profiler y en el Frame Debugger
+
+  6 - Comparar los resultados con el modelo anterior
+ 
+--------------------------------------------------------------------------------
+2. TOOLS USED AND HOW I USED THEM
+--------------------------------------------------------------------------------
+ 
+  A) Unity Profiler
+     - Se grabó una sesión con la escena sin optimizar en Play Mode.
+     - Módulo CPU Usage: se identificó que BehaviourUpdate era el coste
+       dominante. El call stack mostraba UnoptimizedDistanceCube.Update()
+       disparándose cada frame, llamandose 50 veces, y cada llamada
+       iterando sobre los otros 49 cubos.
+     - Módulo Memory: se confirmaron las allocaciones de strings por frame
+       provenientes de Debug.LogWarning y de la interpolación de timerText.text.
+ 
+  B) Frame Debugger
+     - Activado durante Play Mode para inspeccionar las draw calls por frame.
+     - Se confirmó que los 50 cubos spawneados generaban 50 draw calls
+       separadas (sin batching) porque el material no tenía GPU Instancing
+       activado y cada cubo recibía su propia instancia de material.
+     - También se confirmó que el Canvas se estaba reconstruyendo cada frame
+       (marca dirty de TMP).
+ 
+  C) Panel de Statistics del Game View
+     - Se usó el overlay de Statistics en la Game View para comparar el número
+       de batches y el tiempo de CPU antes y después de las optimizaciones.
+     - Sin optimizar: ~338ms de CPU, 15 batches, Saved by batching: 0.
+     - Optimizado: ~12ms de CPU, 15 batches, Saved by batching: 153.
+     El número de batches que se mantiene en 15 es esperado; la métrica clave
+     es el 153 de draw calls ahorradas por GPU Instancing al agrupar los 50
+     cubos en unas pocas llamadas.
+ 
+--------------------------------------------------------------------------------
+3. IS THE SCENE CPU OR GPU BOUND?
+--------------------------------------------------------------------------------
+
+Aunque existen problemas secundarios de GPU, como el hecho de que hayan dos cámaras
+o que se genera un material nuevo para cada cubo cuando se spawnean en la escena, 
+pero no son el cuello de botella principal que afecta a la escena.
+ 
+La escena es principalmente CPU bound ya que
+
+  - El panel de Statistics muestra 338ms de tiempo de CPU antes de optimizar,
+    y el Profiler confirma BehaviourUpdate como el coste dominante.
+  - Debug.LogWarning genera 50 x 49 = 2450 llamadas de log por frame. Cada
+    llamada implica una allocación de string en el heap gestionado y una
+    escritura en el buffer interno de la consola.
+  - Los rebuilds del Canvas de texto añaden carga adicional de CPU para el layout 
+    pass y la regeneración del mesh cada vez que se actualiza el contenido del canvas.
+ 
+--------------------------------------------------------------------------------
+4. WHAT ARE THE PROBLEMS AND WHERE ARE THEY?
+--------------------------------------------------------------------------------
+ 
+  PROBLEMA 1 - Bucle O(N^2) en Update por MonoBehaviour
+
+  Cada una de las 50 instancias de cubo ejecuta su propio Update() e itera
+  sobre los otros cubos. Esto son 50 x 49 = 2450 llamadas a Vector3.Distance
+  por frame. Además, FindObjectsByType<> se llama en el Start() de cada cubo.
+ 
+  PROBLEMA 2 - Debug.LogWarning cada frame dentro de Update()
+
+  Se hacen 2450 llamadas a Debug.LogWarning por frame ya que hace 50 llamadas por
+  49 cubos distintos.
+ 
+  PROBLEMA 3 - Canvas marcado dirty cada frame y allocaciones de string innecesarias
+
+  El TMP_Text.text incondicionalmente fuerza a rebuildear el Canvas por cada frame aunque no
+  se modifique el texto. Unity re-ejecuta entonces el pipeline completo del rebuild del Canvas.
+  Al tener el texto del timer y los botones en el mismo Canvas, cualquier rebuild del timer
+  forzaba también a recalcular los botones aunque estos no hubieran cambiado en absoluto.
+  La interpolación de string alloca un nuevo objeto string en el heap gestionado cada frame,
+  generando una presión constante sobre el Garbage Collector.
+ 
+  PROBLEMA 4 - Dos cámaras activas renderizando simultáneamente
+
+  "Main Camera" y "Main Camera (1)" están ambas activas. Unity renderiza
+  ambos viewports a la vez por cada frame sin dar ninguna ventaja a la app.
+ 
+  PROBLEMA 5 - GPU Instancing desactivado y copias de material por instancia
+  
+  El GPU Instancing estaba desactivado en el propio asset de material.
+  Cada cubo recibía una instancia de material única porque el spawner 
+  accedía a renderer.material en lugar de renderer.sharedMaterial. Unity crea
+  silenciosamente una copia del material por cada objeto cuando se accede
+  al .material, lo que impedía que se hiciera batching.
+ 
+  PROBLEMA 6 - Cubo no marcado como Static
+
+  El Cube suelto de la escena no se mueve pero no está marcado como Static,
+  lo que impide que contribuya o reciba un lighting bakeado.
+
+--------------------------------------------------------------------------------
+5. DESCRIPTION OF OPTIMIZATIONS MADE
+--------------------------------------------------------------------------------
+ 
+CODE REFACTORS:
+ 
+  OPT-1: DistanceCubeManager - un único Update() centralizado para todas las
+         distancias
+    He creado un único MonoBehaviour llamado DistanceCubeManager. El manager 
+    recibe el array de Transforms directamente del spawner en el momento del 
+    spawn de los cubos, para que calcule las distancias una sola vez a 
+    diferencia de como lo hacia antes que calculaba la distancia por cada cubo.
+ 
+  OPT-2: Debug.LogWarning eliminado completamente
+    He eliminado todos los debugs para saber las distancias durante runtime.
+ 
+  OPT-3: OptimizedDistanceCubeSpawner - material compartido via sharedMaterial
+    El spawner ahora acepta una referencia a un shared material en el
+    Inspector y lo asigna usando renderer.sharedMaterial en lugar de usar el
+    renderer.material para no tener que crear uno nuevo por cada caja en la escena.
+ 
+  OPT-4: OptimizedTimerText - actualización del texto por intervalos y StringBuilder 
+
+    a) Actualización por intervalos: el texto solo se actualiza cuando se ha
+       cumplido updateInterval en vez de cada frame.
+    b) StringBuilder: en lugar de interpolar el string ($"Time: {t:0.0}"),
+       se usa un StringBuilder que reutiliza el mismo buffer interno durante 
+       cada escritura. Esto elimina la allocación de un nuevo objeto string
+       en el heap gestionado en cada actualización, reduciendo la presión sobre
+       el Garbage Collector.
+   
+REFACTORS DE ESCENA:
+ 
+  OPT-5: Cámara duplicada desactivada (Main Camera (1))
+    Una sola cámara renderiza la escena. La segunda añadía el doble de coste por
+    cada frame sin obtener ningún beneficio visual.
+ 
+  OPT-6: GPU Instancing activado en CubeMaterial
+    Checkbox Enable GPU Instancing marcado en el asset de material. Combinado
+    con OPT-3 (asignación de material compartido), esto colapsa 50 draw calls
+    en ~2-3.
+ 
+  OPT-7: Cube suelto de la escena marcado como Static
+    El cubo suelto en la escena no se mueve. Lo he marcado como Static para que 
+    pueda recibir una iluminación bakeada en vez de realtime.
+
+  OPT-8: Canvas del texto separado 
+    El texto del timer tiene su propio Canvas, independiente del Canvas que tiene
+    los botones. Cuando el timer cambia y fuerza un rebuild, ese rebuild solo afecta
+    al Canvas del timer haciendo que botones, que nunca cambian, no se ven arrastrados
+    a la rebuild.
+ 
+--------------------------------------------------------------------------------
+6. WHY THESE CHANGES ARE BETTER
+--------------------------------------------------------------------------------
+ 
+OPT-1+2 (DistanceCubeManager + sin logging):
+  He movido toda la lógica a un único manager que reduce a la mitad los checks 
+  de distancia y elimina 49 llamadas innecesarias al Update() por cada frame. 
+  La verdadera ganancia está en eliminar todas las llamadas a Debug.LogWarning/frame,
+  que allocaban ~147.000 strings por segundo y que provocaban stalls frecuentes
+  en el Garbage Collector.
+ 
+OPT-3 (sharedMaterial + GPU Instancing):
+  Al usar un .sharedMaterial en lugar de .material es el requisito previo para que
+  GPU Instancing funcione. Sin él, Unity crea una instancia nueva de material
+  por cubo y no puede agruparlas independientemente de si el Instancing está activado 
+  en el asset. Con un material compartido e instancing activado, la GPU dibuja los 50 
+  cubos en 1 o 2 draw calls instanciadas en lugar de hacer 50 draws individuales
+ 
+OPT-4 (Intervalo de timer + StringBuilder + Canvas separado):
+  Los rebuilds del Canvas implican un layout pass, regeneración del mesh de
+  TMP y una subida a GPU. Ejecutar esto 60 veces por segundo en lugar de 10
+  es trabajo innecesario cuando el valor mostrado cambia a velocidad legible
+  por humanos. Separar el timer en su propio Canvas aísla el coste del rebuild:
+  cuando el timer se actualiza, Unity solo reconstruye ese Canvas y no toca el
+  de los botones. El StringBuilder elimina adicionalmente la allocación de un
+  nuevo string en el heap en cada actualización, reduciendo la presión sobre el 
+  Garbage Collector.
+ 
+OPT-5 (Una sola cámara):
+  Al haber una sola cámara en la escena en vez de dos, se reduce el coste de
+  los recursos que consume a la mitad sin ningún coste visual en la escena.
+ 
+--------------------------------------------------------------------------------
+7. FINAL COMPARISON: UNOPTIMIZED vs OPTIMIZED
+--------------------------------------------------------------------------------
+ 
+Valores medidos desde el panel Statistics del Game View de Unity (Play Mode):
+ 
+  MÉTRICA                          | SIN OPTIMIZAR      | OPTIMIZADO
+  ---------------------------------|--------------------|-----------------
+  Tiempo de CPU (hilo principal)   | ~338ms             | ~12ms
+  FPS (Play Mode en editor)        | ~3 FPS             | ~81 FPS
+  Llamadas MonoBehaviour Update()  | 50 por frame       | 1 por frame
+  Llamadas Vector3.Distance/frame  | 2450               | 1225
+  Llamadas Debug.LogWarning/frame  | 2450               | 0
+  Allocaciones de strings/frame    | ~2455 (log+timer)  | ~10 (solo timer)
+  Cámaras activas                  | 2                  | 1
+  Batches                          | 330                | 15
+  Saved by batching                | 0                  | 153
+  Rebuilds del Canvas/frame        | 60 (cada frame)    | ~10 (cada 100ms)
+  Canvases afectados por rebuild   | 1 (timer+botones)  | solo el del timer
+  Allocaciones de string (timer)   | 60/segundo         | ~10/segundo (StringBuilder)
+  Modo de sombras                  | Hard Shadows RT    | Desactivadas
+  Frecuencia de GC                 | Cada pocos segundos| Poco frecuente 
