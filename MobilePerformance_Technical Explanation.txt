@@ -51,9 +51,9 @@ La pipeline que he seguido se basa en 5 puntos:
 3. IS THE SCENE CPU OR GPU BOUND?
 --------------------------------------------------------------------------------
 
-Aunque existen problemas secundarios de GPU, como el hecho de que hayan dos cámaras
-o que se genera un material nuevo para cada cubo cuando se spawnean en la escena, 
-pero no son el cuello de botella principal que afecta a la escena.
+Aunque existen problemas secundarios de GPU, como el hecho que se genera un material 
+nuevo para cada cubo cuando se spawnean en la escena, pero no es el cuello de botella
+principal que afecta a la escena.
  
 La escena es principalmente CPU bound ya que
 
@@ -64,6 +64,7 @@ La escena es principalmente CPU bound ya que
     escritura en el buffer interno de la consola.
   - Los rebuilds del Canvas de texto añaden carga adicional de CPU para el layout 
     pass y la regeneración del mesh cada vez que se actualiza el contenido del canvas.
+  - Hay dos cámaras activas en la escena duplicando el coste del render.
  
 --------------------------------------------------------------------------------
 4. WHAT ARE THE PROBLEMS AND WHERE ARE THEY?
@@ -209,5 +210,4 @@ OPT-5 (Una sola cámara):
   Rebuilds del Canvas/frame        | 60 (cada frame)    | ~10 (cada 100ms)
   Canvases afectados por rebuild   | 1 (timer+botones)  | solo el del timer
   Allocaciones de string (timer)   | 60/segundo         | ~10/segundo (StringBuilder)
-  Modo de sombras                  | Hard Shadows RT    | Desactivadas
   Frecuencia de GC                 | Cada pocos segundos| Poco frecuente 
