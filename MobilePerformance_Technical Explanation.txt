@@ -195,8 +195,6 @@ OPT-5 (Una sola cámara):
 7. FINAL COMPARISON: UNOPTIMIZED vs OPTIMIZED
 --------------------------------------------------------------------------------
  
-Valores medidos desde el panel Statistics del Game View de Unity (Play Mode):
- 
   MÉTRICA                          | SIN OPTIMIZAR      | OPTIMIZADO
   ---------------------------------|--------------------|-----------------
   Tiempo de CPU (hilo principal)   | ~338ms             | ~12ms
